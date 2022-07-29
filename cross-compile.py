@@ -3,14 +3,12 @@ import argparse
 import numpy as np
 
 import tvm
-from tvm import relay, autotvm
+from tvm import relay, autotvm, auto_scheduler
 from tvm.contrib import ndk
 
 
 target = 'llvm -model=snapdragon835 -mtriple=arm-linux-android -mattr=+neon'
-# target = 'llvm -mtriple=armv7-linux-androideabi24 -mfloat-abi=soft'
 target_host = 'llvm -mtriple=aarch64-linux-android-g++'
-# target_host = 'llvm -mtriple=armv7a-linux-androideabi24-clang'
 
 model_dir = "models"
 log_dir = "logs"
@@ -158,7 +156,7 @@ class ModelImporter(object):
         return mod, params
 
 
-    def import_mace_yolo_v3(self, dtype="float32"):
+    def import_mace_yolov3(self, target="llvm", dtype="float32"):
         model_url = "http://cnbj1.fds.api.xiaomi.com/mace/miai-models/yolo-v3/yolo-v3.pb"
         filename = "mace_yolo-v3"
         graph_def = self.get_graphdef_from_tf1(model_url, filename)
@@ -166,14 +164,21 @@ class ModelImporter(object):
         mod, params = relay.frontend.from_tensorflow(graph_def, shape=shape_dict,
                                         outputs=["conv2d_59/BiasAdd","conv2d_67/BiasAdd","conv2d_75/BiasAdd"])
 
-        from tvm.relay import transform
-        #mod = transform.DynamicToStatic()(mod)
-        mod = relay.quantize.prerequisite_optimize(mod, params)
+        # # We assume our model's heavily-layout sensitive operators only consist of nn.conv2d
+        # desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
 
+        # # Convert the layout to NCHW
+        # # RemoveUnunsedFunctions is used to clean up the graph.
+        # seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
+        #                                 relay.transform.ConvertLayout(desired_layouts)])
+        # with tvm.transform.PassContext(opt_level=3):
+        #     mod = seq(mod)
+
+        mod = relay.quantize.prerequisite_optimize(mod, params)
+        # downcast to float16
         if dtype == "float16":
             mod = downcast_fp16(mod["main"], mod)
             mod = relay.quantize.prerequisite_optimize(mod, params)
-
         return mod, params
 
 
@@ -426,6 +431,45 @@ class Executor:
                 lib = relay.build_module.build(mod, target=self.target, target_host=self.target_host, params=params)
         lib.export_library(f"{args.name}.atvm.so", ndk.create_shared)
 
+    def run_tuning(tasks, task_weights, log_file):
+        print("Begin tuning...")
+        tuner = auto_scheduler.TaskScheduler(tasks, task_weights)
+        builder=auto_scheduler.LocalBuilder(build_func=ndk.create_shared, timeout=15)
+        tune_option = auto_scheduler.TuningOptions(
+            builder=builder,
+            num_measure_trials=512,
+            num_measures_per_round = 64, # to speed-up round-robin measurements
+            runner=auto_scheduler.RPCRunner(
+                args.rpc_key,
+                host=args.rpc_tracker_host,
+                port=args.rpc_tracker_port,
+            ),
+            measure_callbacks=[auto_scheduler.RecordToFile(log_file)],
+            # verbose=2
+        )
+        tuner.tune(tune_option)
+
+    def tune_ansor(self, mod, params):
+        log_file = os.path.join(log_dir, f"{args.name}.ansor.json")
+
+        tasks, task_weights = auto_scheduler.extract_tasks(
+            mod["main"], params, target=self.target, target_host=self.target_host)
+        for idx, task in enumerate(tasks):
+            print("========== Task %d  (workload key: %s) ==========" %
+                (idx, task.workload_key))
+            print(task.compute_dag)
+
+        Executor.run_tuning(tasks, task_weights, log_file)
+
+    def compile_ansor(self, mod, params):
+        log_file = os.path.join(log_dir, f"{args.name}.ansor.json")
+
+        with auto_scheduler.ApplyHistoryBest(log_file):
+            with tvm.transform.PassContext(opt_level=3, config={"relay.backend.use_auto_scheduler": True}):
+                lib = relay.build(mod, target=target,
+                                    target_host=target_host, params=params)
+
+        lib.export_library(f"{args.name}.ansor.so", ndk.create_shared)
     
     def benchmark(self, input_path):
         from tvm.contrib import  graph_executor
@@ -459,7 +503,8 @@ def main():
             executor.tune_autotvm(mod, params)
             executor.compile_autotvm(mod, params)
         elif args.tune_parser == "ansor":
-            pass
+            executor.tune_ansor(mod, params)
+            executor.compile_ansor(mod, params)
 
         if args.disable_inference == False:
             executor.benchmark(input_path=f"{args.name}.{args.tune_parser}.so")
