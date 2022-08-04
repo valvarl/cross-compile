@@ -156,7 +156,7 @@ class ModelImporter(object):
         return mod, params
 
 
-    def import_mace_yolov3(self, target="llvm", dtype="float32"):
+    def import_mace_yolo_v3(self, target="llvm", dtype="float32"):
         model_url = "http://cnbj1.fds.api.xiaomi.com/mace/miai-models/yolo-v3/yolo-v3.pb"
         filename = "mace_yolo-v3"
         graph_def = self.get_graphdef_from_tf1(model_url, filename)
@@ -164,15 +164,16 @@ class ModelImporter(object):
         mod, params = relay.frontend.from_tensorflow(graph_def, shape=shape_dict,
                                         outputs=["conv2d_59/BiasAdd","conv2d_67/BiasAdd","conv2d_75/BiasAdd"])
 
-         # We assume our model's heavily-layout sensitive operators only consist of nn.conv2d
-        desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
+        if args.tune_parser == "atvm":
+            # We assume our model's heavily-layout sensitive operators only consist of nn.conv2d
+            desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
 
-         # Convert the layout to NCHW
-         # RemoveUnunsedFunctions is used to clean up the graph.
-        seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
-                                         relay.transform.ConvertLayout(desired_layouts)])
-        with tvm.transform.PassContext(opt_level=3):
-            mod = seq(mod)
+            # Convert the layout to NCHW
+            # RemoveUnunsedFunctions is used to clean up the graph.
+            seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
+                                            relay.transform.ConvertLayout(desired_layouts)])
+            with tvm.transform.PassContext(opt_level=3):
+                mod = seq(mod)
 
         mod = relay.quantize.prerequisite_optimize(mod, params)
         # downcast to float16
