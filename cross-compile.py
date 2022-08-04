@@ -164,15 +164,15 @@ class ModelImporter(object):
         mod, params = relay.frontend.from_tensorflow(graph_def, shape=shape_dict,
                                         outputs=["conv2d_59/BiasAdd","conv2d_67/BiasAdd","conv2d_75/BiasAdd"])
 
-        # # We assume our model's heavily-layout sensitive operators only consist of nn.conv2d
-        # desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
+         # We assume our model's heavily-layout sensitive operators only consist of nn.conv2d
+        desired_layouts = {'nn.conv2d': ['NCHW', 'default']}
 
-        # # Convert the layout to NCHW
-        # # RemoveUnunsedFunctions is used to clean up the graph.
-        # seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
-        #                                 relay.transform.ConvertLayout(desired_layouts)])
-        # with tvm.transform.PassContext(opt_level=3):
-        #     mod = seq(mod)
+         # Convert the layout to NCHW
+         # RemoveUnunsedFunctions is used to clean up the graph.
+        seq = tvm.transform.Sequential([relay.transform.RemoveUnusedFunctions(),
+                                         relay.transform.ConvertLayout(desired_layouts)])
+        with tvm.transform.PassContext(opt_level=3):
+            mod = seq(mod)
 
         mod = relay.quantize.prerequisite_optimize(mod, params)
         # downcast to float16
@@ -437,7 +437,7 @@ class Executor:
         builder=auto_scheduler.LocalBuilder(build_func=ndk.create_shared, timeout=15)
         tune_option = auto_scheduler.TuningOptions(
             builder=builder,
-            num_measure_trials=512,
+            num_measure_trials=2048,
             num_measures_per_round = 64, # to speed-up round-robin measurements
             runner=auto_scheduler.RPCRunner(
                 args.rpc_key,
